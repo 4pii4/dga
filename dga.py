@@ -14,6 +14,7 @@ import getpass
 import argparse
 import stealth_requests
 import shutil
+import math
 
 # ==========================================
 # DEPENDENCY CHECKS (Fails fast if missing)
@@ -111,6 +112,44 @@ def get_magic_type(file_path: Path) -> str:
             return 'mp4'
 
     return 'unknown'
+
+def compress_gif(input_path: Path, target_size: int) -> Path:
+    """Compresses GIF by dynamically reducing resolution to fit the target size, preserving maximum quality."""
+    output_path = input_path.with_name(f"compressed_{input_path.name}")
+    try:
+        import ffmpeg
+        
+        current_size = os.path.getsize(input_path)
+        if current_size <= target_size:
+            return input_path
+            
+        # Calculate how much we need to shrink. 
+        # File size scales roughly with the number of pixels (area).
+        # We multiply by 0.85 for a safety margin to ensure it falls under the limit.
+        ratio = target_size / current_size
+        scale_factor = math.sqrt(ratio) * 0.85 
+        scale_factor = max(0.1, min(1.0, scale_factor))
+        
+        stream = ffmpeg.input(str(input_path))
+        # Scale proportionally based on the calculated factor
+        v = stream.video.filter('scale', f'trunc(iw*{scale_factor})', '-1')
+        split = v.split()
+        # Use 256 colors and default high-quality dithering (instead of aggressive bayer)
+        palette = split[0].filter('palettegen', max_colors=256)
+        out = ffmpeg.filter([split[1], palette], 'paletteuse')
+        
+        (
+            ffmpeg
+            .output(out, str(output_path), loglevel="error")
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+        if output_path.exists():
+            return output_path
+    except Exception as e:
+        print(f"Compression failed: {e}")
+        
+    return input_path
 
 def convert_to_gif(input_path: Path) -> Path:
     """Uses ffmpeg-python or Wand (ImageMagick) to convert media to GIF format."""
@@ -267,11 +306,11 @@ async def archive_command(interaction: discord.Interaction, link: str = None, im
                 await interaction.followup.send(f"❌ Failed to download file. HTTP {resp.status_code}")
                 return
             
-            # Immediately reject if the downloaded blob exceeds the limit
-            if len(resp.content) > upload_limit:
+            # Immediately reject if the downloaded blob exceeds 150% of the limit
+            if len(resp.content) > upload_limit * 1.5:
                 await interaction.followup.send(
                     f"❌ **Download Rejected:** The source file ({len(resp.content) / (1024 * 1024):.1f} MB) "
-                    f"exceeds the archiving server's upload limit ({upload_limit / (1024 * 1024):.1f} MB)."
+                    f"is too large. It exceeds 150% of the server's upload limit ({upload_limit / (1024 * 1024):.1f} MB)."
                 )
                 return
 
@@ -285,10 +324,10 @@ async def archive_command(interaction: discord.Interaction, link: str = None, im
             
         else:
             # 2b. Check size limits immediately on uploaded attachment
-            if image.size > upload_limit:
+            if image.size > upload_limit * 1.5:
                 await interaction.followup.send(
                     f"❌ **Upload Rejected:** The provided image ({image.size / (1024 * 1024):.1f} MB) "
-                    f"exceeds the archiving server's upload limit ({upload_limit / (1024 * 1024):.1f} MB)."
+                    f"is too large. It exceeds 150% of the server's upload limit ({upload_limit / (1024 * 1024):.1f} MB)."
                 )
                 return
                 
@@ -312,14 +351,30 @@ async def archive_command(interaction: discord.Interaction, link: str = None, im
             await interaction.followup.send(f"❌ **Conversion Error:** `{e}`")
             return
 
-        # Double check size after conversion (GIF format can massively inflate file sizes)
+        # Double check size after conversion, and apply compression if needed
         file_size = os.path.getsize(final_file)
         if file_size > upload_limit:
-            await interaction.followup.send(
-                f"❌ **Converted File Too Large:** The resulting GIF inflated to ({file_size / (1024 * 1024):.1f} MB), "
-                f"which exceeds the server's {upload_limit / (1024 * 1024):.1f} MB limit."
-            )
-            return
+            if file_size <= upload_limit * 1.5:
+                try:
+                    compressed_file = await asyncio.to_thread(compress_gif, final_file, upload_limit)
+                    
+                    if compressed_file != final_file:
+                        # Ensure we clean up the uncompressed output file so it isn't orphaned
+                        if final_file != temp_file and final_file.exists():
+                            final_file.unlink()
+                        final_file = compressed_file
+                        
+                    file_size = os.path.getsize(final_file)
+                except Exception as e:
+                    print(f"Compression error: {e}")
+
+            # Re-check against the upload limit in case compression wasn't enough
+            if file_size > upload_limit:
+                await interaction.followup.send(
+                    f"❌ **Converted File Too Large:** Even after optimization, the GIF ({file_size / (1024 * 1024):.1f} MB) "
+                    f"exceeds the server's {upload_limit / (1024 * 1024):.1f} MB limit."
+                )
+                return
 
         # 4. Upload to Target Channel
         try:
@@ -349,7 +404,7 @@ async def archive_command(interaction: discord.Interaction, link: str = None, im
         # 5. Guaranteed local cleanup 
         if temp_file and temp_file.exists():
             temp_file.unlink()
-        if final_file and final_file.exists():
+        if final_file and final_file.exists() and final_file != temp_file:
             final_file.unlink()
 
 if __name__ == "__main__":
