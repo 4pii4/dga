@@ -77,6 +77,7 @@ MEDIA_TYPES = {
     'image/gif': '.gif', 'video/mp4': '.mp4', 'image/png': '.png',
     'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'video/webm': '.webm',
     'image/webp': '.webp', 'video/quicktime': '.mov',
+    'image/avif': '.avif', 'image/apng': '.apng'
 }
 
 def convert_to_gif(input_path: Path) -> Path:
@@ -88,31 +89,46 @@ def convert_to_gif(input_path: Path) -> Path:
         return input_path
         
     errors = []
+    is_video = input_path.suffix.lower() in ['.mp4', '.webm', '.mov']
     
-    # Attempt 1: FFmpeg via ffmpeg-python wrapper
-    try:
-        (
-            ffmpeg
-            .input(str(input_path))
-            .output(str(output_path), loglevel="error")
-            .overwrite_output()
-            .run(capture_stdout=True, capture_stderr=True)
-        )
-        if output_path.exists():
-            return output_path
-    except ffmpeg.Error as e:
-        stderr_text = e.stderr.decode('utf-8', errors='ignore').strip() if e.stderr else "Unknown error"
-        errors.append(f"FFmpeg failed: {stderr_text}")
+    def try_ffmpeg():
+        try:
+            (
+                ffmpeg
+                .input(str(input_path))
+                .output(str(output_path), loglevel="error")
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True)
+            )
+            if output_path.exists():
+                return True
+        except ffmpeg.Error as e:
+            stderr_text = e.stderr.decode('utf-8', errors='ignore').strip() if e.stderr else "Unknown error"
+            errors.append(f"FFmpeg failed: {stderr_text}")
+        except Exception as e:
+            errors.append(f"FFmpeg exception: {e}")
+        return False
         
-    # Attempt 2: ImageMagick via Wand wrapper
-    try:
-        with WandImage(filename=str(input_path)) as img:
-            img.format = 'gif'
-            img.save(filename=str(output_path))
-        if output_path.exists():
-            return output_path
-    except Exception as e:
-        errors.append(f"Magick failed: {e}")
+    def try_wand():
+        try:
+            with WandImage(filename=str(input_path)) as img:
+                img.format = 'gif'
+                img.save(filename=str(output_path))
+            if output_path.exists():
+                return True
+        except Exception as e:
+            errors.append(f"Magick failed: {e}")
+        return False
+
+    # FFmpeg is superior/faster for raw video formats.
+    # ImageMagick correctly processes frames in animated image sequences (AVIF, WebP, APNG)
+    # Priority is determined here so FFmpeg doesn't falsely succeed by ripping 1 frame out of a mislabeled AVIF.
+    if is_video:
+        if try_ffmpeg(): return output_path
+        if try_wand(): return output_path
+    else:
+        if try_wand(): return output_path
+        if try_ffmpeg(): return output_path
         
     raise RuntimeError(" | ".join(errors))
 
