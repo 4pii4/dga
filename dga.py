@@ -80,6 +80,38 @@ MEDIA_TYPES = {
     'image/avif': '.avif', 'image/apng': '.apng'
 }
 
+def get_magic_type(file_path: Path) -> str:
+    """Reads file signatures (magic bytes) to strictly identify the file format."""
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(32)
+    except Exception:
+        return 'unknown'
+
+    if header.startswith(b'GIF8'):
+        return 'gif'
+    if header.startswith(b'\x1aE\xdf\xa3'):
+        return 'webm'
+    if header.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    if header.startswith(b'\xff\xd8\xff'):
+        return 'jpeg'
+    if header.startswith(b'RIFF') and header[8:12] == b'WEBP':
+        return 'webp'
+
+    # Check ISO Base Media File Formats (MP4, MOV, AVIF)
+    if len(header) >= 12 and header[4:8] == b'ftyp':
+        brand = header[8:12]
+        # Some AVIFs bury their brand under compatible brands, so we scan the chunk
+        if brand in (b'avif', b'avis') or b'avif' in header[16:32] or b'avis' in header[16:32]:
+            return 'avif'
+        elif brand in (b'qt  ',):
+            return 'mov'
+        else:
+            return 'mp4'
+
+    return 'unknown'
+
 def convert_to_gif(input_path: Path) -> Path:
     """Uses ffmpeg-python or Wand (ImageMagick) to convert media to GIF format."""
     output_path = input_path.with_suffix('.gif')
@@ -263,6 +295,15 @@ async def archive_command(interaction: discord.Interaction, link: str = None, im
             ext = f".{image.filename.split('.')[-1].lower()}" if '.' in image.filename else '.bin'
             temp_file = TEMP_DIR / f"temp_{interaction.id}{ext}"
             await image.save(temp_file)
+
+        # --- Magic Bytes Detection & Extension Fix ---
+        # This prevents mislabeled files (e.g. animated AVIFs saved as .jpg or .mp4) 
+        # from tricking the conversion priority engine.
+        magic_type = get_magic_type(temp_file)
+        if magic_type != 'unknown' and temp_file.suffix.lower() != f'.{magic_type}':
+            proper_temp_file = temp_file.with_name(f"temp_{interaction.id}.{magic_type}")
+            shutil.move(str(temp_file), str(proper_temp_file))
+            temp_file = proper_temp_file
 
         # 3. FFmpeg / ImageMagick Conversion
         try:
