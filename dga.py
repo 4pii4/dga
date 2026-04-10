@@ -114,7 +114,7 @@ def get_magic_type(file_path: Path) -> str:
     return 'unknown'
 
 def compress_gif(input_path: Path, target_size: int) -> Path:
-    """Compresses GIF by dynamically reducing resolution to fit the target size, preserving maximum quality."""
+    """Compresses GIF by dynamically reducing resolution, fps, and colors to fit the target size."""
     output_path = input_path.with_name(f"compressed_{input_path.name}")
     try:
         import ffmpeg
@@ -124,19 +124,23 @@ def compress_gif(input_path: Path, target_size: int) -> Path:
             return input_path
             
         # Calculate how much we need to shrink. 
-        # File size scales roughly with the number of pixels (area).
-        # We multiply by 0.85 for a safety margin to ensure it falls under the limit.
         ratio = target_size / current_size
-        scale_factor = math.sqrt(ratio) * 0.85 
+        
+        # Aggressive dynamic scaling with a stronger safety margin
+        scale_factor = math.sqrt(ratio) * 0.75 
         scale_factor = max(0.1, min(1.0, scale_factor))
         
+        # Reduce colors if the ratio is extreme (need to shrink by a lot)
+        colors = 256 if ratio > 0.4 else 128 if ratio > 0.2 else 64
+        
         stream = ffmpeg.input(str(input_path))
-        # Scale proportionally based on the calculated factor
-        v = stream.video.filter('scale', f'trunc(iw*{scale_factor})', '-1')
+        # Drop fps to 15 and scale down proportionally to severely cut down size
+        v = stream.video.filter('fps', fps=15).filter('scale', w=f'trunc(iw*{scale_factor})', h='-1')
         split = v.split()
-        # Use 256 colors and default high-quality dithering (instead of aggressive bayer)
-        palette = split[0].filter('palettegen', max_colors=256)
-        out = ffmpeg.filter([split[1], palette], 'paletteuse')
+        
+        palette = split[0].filter('palettegen', max_colors=colors)
+        # Use bayer dither for optimal Discord meme compression vs size
+        out = ffmpeg.filter([split[1], palette], 'paletteuse', dither='bayer', bayer_scale=5)
         
         (
             ffmpeg
@@ -164,13 +168,27 @@ def convert_to_gif(input_path: Path) -> Path:
     
     def try_ffmpeg():
         try:
-            (
-                ffmpeg
-                .input(str(input_path))
-                .output(str(output_path), loglevel="error")
-                .overwrite_output()
-                .run(capture_stdout=True, capture_stderr=True)
-            )
+            if is_video:
+                # Sane defaults for raw video -> GIF so it doesn't explode in RAM/size natively
+                stream = ffmpeg.input(str(input_path))
+                v = stream.video.filter('fps', fps=24).filter('scale', w='min(iw,800)', h='-1')
+                split = v.split()
+                palette = split[0].filter('palettegen')
+                out = ffmpeg.filter([split[1], palette], 'paletteuse')
+                (
+                    ffmpeg
+                    .output(out, str(output_path), loglevel="error")
+                    .overwrite_output()
+                    .run(capture_stdout=True, capture_stderr=True)
+                )
+            else:
+                (
+                    ffmpeg
+                    .input(str(input_path))
+                    .output(str(output_path), loglevel="error")
+                    .overwrite_output()
+                    .run(capture_stdout=True, capture_stderr=True)
+                )
             if output_path.exists():
                 return True
         except ffmpeg.Error as e:
