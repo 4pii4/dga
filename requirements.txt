@@ -1,3 +1,4 @@
-discord.py
-httpx
-Pillow
+discord.py>=2.4.0
+ffmpeg-python
+Wand
+stealth_requests

@@ -2,6 +2,8 @@ FROM python:3.14-alpine AS builder
 WORKDIR /dga
 COPY requirements.txt .
 RUN pip3.14 install -r ./requirements.txt
+RUN apt update
+RUN apt install ffmpeg imagemagick
 
 FROM python:3.14-alpine
 WORKDIR /dga

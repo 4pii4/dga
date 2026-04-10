@@ -1,7 +1,6 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import httpx
 import os
 import re
 import html
@@ -9,10 +8,31 @@ import mimetypes
 from urllib.parse import urlparse, unquote, parse_qs
 from pathlib import Path
 import asyncio
-from PIL import Image
 import json
 import sys
+import getpass
 import argparse
+import stealth_requests
+import shutil
+
+# ==========================================
+# DEPENDENCY CHECKS (Fails fast if missing)
+# ==========================================
+try:
+    import ffmpeg
+    from wand.image import Image as WandImage
+except ImportError as e:
+    print(f"CRITICAL ERROR: Required python package missing. ({e})")
+    print("Please install them using: pip install ffmpeg-python Wand")
+    sys.exit(1)
+
+if not shutil.which("ffmpeg"):
+    print("CRITICAL ERROR: 'ffmpeg' command not found in your system PATH.")
+    sys.exit(1)
+
+if not shutil.which("magick"):
+    print("CRITICAL ERROR: 'magick' (ImageMagick) command not found in your system PATH.")
+    sys.exit(1)
 
 # ==========================================
 # CONFIGURATION (Loaded from provided config)
@@ -59,6 +79,43 @@ MEDIA_TYPES = {
     'image/webp': '.webp', 'video/quicktime': '.mov',
 }
 
+def convert_to_gif(input_path: Path) -> Path:
+    """Uses ffmpeg-python or Wand (ImageMagick) to convert media to GIF format."""
+    output_path = input_path.with_suffix('.gif')
+    
+    # If already a GIF, no conversion needed
+    if input_path.suffix.lower() == '.gif':
+        return input_path
+        
+    errors = []
+    
+    # Attempt 1: FFmpeg via ffmpeg-python wrapper
+    try:
+        (
+            ffmpeg
+            .input(str(input_path))
+            .output(str(output_path), loglevel="error")
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+        if output_path.exists():
+            return output_path
+    except ffmpeg.Error as e:
+        stderr_text = e.stderr.decode('utf-8', errors='ignore').strip() if e.stderr else "Unknown error"
+        errors.append(f"FFmpeg failed: {stderr_text}")
+        
+    # Attempt 2: ImageMagick via Wand wrapper
+    try:
+        with WandImage(filename=str(input_path)) as img:
+            img.format = 'gif'
+            img.save(filename=str(output_path))
+        if output_path.exists():
+            return output_path
+    except Exception as e:
+        errors.append(f"Magick failed: {e}")
+        
+    raise RuntimeError(" | ".join(errors))
+
 class URLResolver:
     """Stripped down resolver for Tenor/Giphy links"""
     @staticmethod
@@ -76,13 +133,15 @@ class URLResolver:
 
         if 'tenor.com' in domain and '/view/' in url:
             try:
-                async with httpx.AsyncClient() as client:
+                def _fetch_tenor():
                     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-                    resp = await client.get(url, headers=headers, follow_redirects=True)
-                    match_gif = re.search(r'content="(https://[^"]+\.tenor\.com/[^"]+\.gif)"', resp.text)
-                    if match_gif: return match_gif.group(1)
-                    match_mp4 = re.search(r'content="(https://[^"]+\.tenor\.com/[^"]+\.mp4)"', resp.text)
-                    if match_mp4: return match_mp4.group(1)
+                    return stealth_requests.get(url, headers=headers).text
+                    
+                html_text = await asyncio.to_thread(_fetch_tenor)
+                match_gif = re.search(r'content="(https://[^"]+\.tenor\.com/[^"]+\.gif)"', html_text)
+                if match_gif: return match_gif.group(1)
+                match_mp4 = re.search(r'content="(https://[^"]+\.tenor\.com/[^"]+\.mp4)"', html_text)
+                if match_mp4: return match_mp4.group(1)
             except Exception as e:
                 print(f"Tenor resolve error: {e}")
                 
@@ -125,14 +184,25 @@ async def on_ready():
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def archive_command(interaction: discord.Interaction, link: str = None, image: discord.Attachment = None):
-    # Instantly defer ephemerally so Discord knows we are processing (prevents timeout)
+    # Instantly defer ephemerally so Discord knows we are processing
     await interaction.response.defer(ephemeral=True)
 
     if bool(link) == bool(image):
         await interaction.followup.send("❌ Please provide exactly **one** option: either a `link` or an `image`.")
         return
 
+    # Default Variables for Safe Cleanup
+    temp_file = None
+    final_file = None
+
     try:
+        # Fetch target channel & Calculate Guild Limit (Default to unboosted 25MB limit)
+        channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if not channel:
+            channel = await bot.fetch_channel(TARGET_CHANNEL_ID)
+            
+        upload_limit = channel.guild.filesize_limit if hasattr(channel, 'guild') else 25 * 1024 * 1024
+
         if link:
             # 1. Resolve URL
             resolved_url = await URLResolver.resolve_url(link)
@@ -140,61 +210,65 @@ async def archive_command(interaction: discord.Interaction, link: str = None, im
                 await interaction.followup.send("❌ Invalid URL provided.")
                 return
 
-            # 2a. Download File from Link
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(resolved_url, timeout=30.0, follow_redirects=True)
-                if resp.status_code != 200:
-                    await interaction.followup.send(f"❌ Failed to download file. HTTP {resp.status_code}")
-                    return
+            # 2a. Download File from Link using Stealth Requests
+            def _download_file():
+                return stealth_requests.get(resolved_url, timeout=30.0)
                 
-                content_type = resp.headers.get('Content-Type', '').split(';')[0].strip().lower()
-                ext = MEDIA_TYPES.get(content_type, '.bin')
-                if ext == '.bin':
-                    ext = '.' + resolved_url.split('?')[0].split('.')[-1]
-                
-                temp_file = TEMP_DIR / f"temp_{interaction.id}{ext}"
-                temp_file.write_bytes(resp.content)
+            resp = await asyncio.to_thread(_download_file)
+            if resp.status_code != 200:
+                await interaction.followup.send(f"❌ Failed to download file. HTTP {resp.status_code}")
+                return
+            
+            # Immediately reject if the downloaded blob exceeds the limit
+            if len(resp.content) > upload_limit:
+                await interaction.followup.send(
+                    f"❌ **Download Rejected:** The source file ({len(resp.content) / (1024 * 1024):.1f} MB) "
+                    f"exceeds the archiving server's upload limit ({upload_limit / (1024 * 1024):.1f} MB)."
+                )
+                return
+
+            content_type = resp.headers.get('Content-Type', '').split(';')[0].strip().lower()
+            ext = MEDIA_TYPES.get(content_type, '.bin')
+            if ext == '.bin':
+                ext = '.' + resolved_url.split('?')[0].split('.')[-1]
+            
+            temp_file = TEMP_DIR / f"temp_{interaction.id}{ext}"
+            temp_file.write_bytes(resp.content)
+            
         else:
-            # 2b. Download File from Attachment
+            # 2b. Check size limits immediately on uploaded attachment
+            if image.size > upload_limit:
+                await interaction.followup.send(
+                    f"❌ **Upload Rejected:** The provided image ({image.size / (1024 * 1024):.1f} MB) "
+                    f"exceeds the archiving server's upload limit ({upload_limit / (1024 * 1024):.1f} MB)."
+                )
+                return
+                
             ext = f".{image.filename.split('.')[-1].lower()}" if '.' in image.filename else '.bin'
             temp_file = TEMP_DIR / f"temp_{interaction.id}{ext}"
             await image.save(temp_file)
 
-        # 3. Pillow Conversion (Convert static images to GIF)
-        final_file = temp_file
-        if temp_file.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']:
-            try:
-                with Image.open(temp_file) as img:
-                    gif_path = temp_file.with_suffix('.gif')
-                    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-                        img = img.convert("RGBA")
-                    img.save(gif_path, 'GIF', save_all=getattr(img, "is_animated", False))
-                temp_file.unlink()
-                final_file = gif_path
-            except Exception as e:
-                print(f"Pillow error: {e}")
-
-        # 4. Fetch target channel and check server limits
-        channel = bot.get_channel(TARGET_CHANNEL_ID)
-        if not channel:
-            channel = await bot.fetch_channel(TARGET_CHANNEL_ID)
-
-        upload_limit = channel.guild.filesize_limit if hasattr(channel, 'guild') else 25 * 1024 * 1024
-        file_size = os.path.getsize(final_file)
-
-        if file_size > upload_limit:
-            await interaction.followup.send(
-                f"❌ **File Too Large:** The downloaded GIF ({file_size / (1024 * 1024):.1f} MB) "
-                f"exceeds the archiving server's maximum upload limit ({upload_limit / (1024 * 1024):.1f} MB)."
-            )
-            final_file.unlink()
+        # 3. FFmpeg / ImageMagick Conversion
+        try:
+            final_file = await asyncio.to_thread(convert_to_gif, temp_file)
+        except Exception as e:
+            await interaction.followup.send(f"❌ **Conversion Error:** `{e}`")
             return
 
-        # 5. Upload to Target Channel
+        # Double check size after conversion (GIF format can massively inflate file sizes)
+        file_size = os.path.getsize(final_file)
+        if file_size > upload_limit:
+            await interaction.followup.send(
+                f"❌ **Converted File Too Large:** The resulting GIF inflated to ({file_size / (1024 * 1024):.1f} MB), "
+                f"which exceeds the server's {upload_limit / (1024 * 1024):.1f} MB limit."
+            )
+            return
+
+        # 4. Upload to Target Channel
         try:
             with open(final_file, 'rb') as f:
                 discord_file = discord.File(f, filename=final_file.name)
-                # Tag the message with the original link or image name so you know where it came from
+                # Tag the message with the original link or image name
                 source_text = f"<{link}>" if link else f"uploaded image (`{image.filename}`)"
                 msg = await channel.send(content=f"Archived from: {source_text}", file=discord_file)
                 
@@ -208,15 +282,18 @@ async def archive_command(interaction: discord.Interaction, link: str = None, im
                 )
             else:
                 await interaction.followup.send(f"❌ **Discord API Error:** `{e}`")
-                
-        finally:
-            if final_file.exists():
-                final_file.unlink()
 
     except Exception as e:
         await interaction.followup.send(f"❌ An error occurred: `{str(e)}`")
         source_log = link if link else image.filename
         print(f"Error archiving {source_log}: {e}")
+        
+    finally:
+        # 5. Guaranteed local cleanup 
+        if temp_file and temp_file.exists():
+            temp_file.unlink()
+        if final_file and final_file.exists():
+            final_file.unlink()
 
 if __name__ == "__main__":
     bot.run(BOT_TOKEN)
