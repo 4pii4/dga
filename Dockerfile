@@ -9,6 +9,6 @@ COPY . .
 COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
 RUN addgroup -g 1000 -S dga && adduser -u 1000 -S dga -G dga
 RUN chown dga:dga /dga
-RUN apk add --no-cache ffmpeg imagemagick imagemagick-libs
+RUN apk add --no-cache ffmpeg imagemagick imagemagick-libs imagemagick-dev
 USER dga
 CMD ["python3.14", "/dga/dga.py", "--config", "/dga/config.json"]
