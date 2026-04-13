@@ -319,8 +319,22 @@ def initialize_app():
     async def archive_command(interaction: discord.Interaction, link: str = None, image: discord.Attachment = None):
         await interaction.response.defer(ephemeral=True)
 
+        async def safe_reply(content: str):
+            try:
+                if not interaction.is_expired():
+                    await interaction.followup.send(content)
+                else:
+                    await interaction.user.send(content)
+            except discord.errors.NotFound:
+                try:
+                    await interaction.user.send(content)
+                except discord.errors.Forbidden:
+                    pass
+            except Exception:
+                pass
+
         if bool(link) == bool(image):
-            await interaction.followup.send("❌ Please provide exactly **one** option: either a `link` or an `image`.")
+            await safe_reply("❌ Please provide exactly **one** option: either a `link` or an `image`.")
             return
 
         temp_file: Optional[Path] = None
@@ -344,7 +358,7 @@ def initialize_app():
             try:
                 final_file = await asyncio.to_thread(MediaProcessor.convert_to_gif, temp_file)
             except Exception as e:
-                await interaction.followup.send(f"❌ **Conversion Error:** `{e}`")
+                await safe_reply(f"❌ **Conversion Error:** `{e}`")
                 return
 
             file_size = os.path.getsize(final_file)
@@ -360,7 +374,7 @@ def initialize_app():
                     file_size = os.path.getsize(final_file)
 
                 if file_size > upload_limit:
-                    await interaction.followup.send(
+                    await safe_reply(
                         f"❌ **Converted File Too Large:** Even after optimization, the GIF ({file_size / (1024 * 1024):.1f} MB) "
                         f"exceeds the server's {upload_limit / (1024 * 1024):.1f} MB limit."
                     )
@@ -372,22 +386,22 @@ def initialize_app():
                     source_text = f"<{link}>" if link else f"uploaded image (`{image.filename}`)"
                     msg = await channel.send(content=f"Archived from: {source_text}", file=discord_file)
                     
-                await interaction.followup.send(f"✅ **Saved successfully!**\n[Click here to jump to the GIF]({msg.jump_url})")
+                await safe_reply(f"✅ **Saved successfully!**\n[Click here to jump to the GIF]({msg.jump_url})")
 
             except discord.errors.HTTPException as e:
                 if e.status == 413 or e.code == 40005:
-                    await interaction.followup.send(
+                    await safe_reply(
                         f"❌ **Upload Failed:** Discord rejected the file (Payload Too Large). "
                         f"Size: {file_size / (1024*1024):.1f} MB."
                     )
                 else:
-                    await interaction.followup.send(f"❌ **Discord API Error:** `{e}`")
+                    await safe_reply(f"❌ **Discord API Error:** `{e}`")
 
         except ValueError as ve:
-            await interaction.followup.send(f"❌ {str(ve)}")
+            await safe_reply(f"❌ {str(ve)}")
             
         except Exception as e:
-            await interaction.followup.send(f"❌ An unexpected error occurred: `{str(e)}`")
+            await safe_reply(f"❌ An unexpected error occurred: `{str(e)}`")
             source_log = link if link else image.filename
             print(f"Error archiving {source_log}: {e}")
             
