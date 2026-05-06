@@ -6,6 +6,7 @@ RUN pip --no-cache-dir install -r ./requirements.txt
 FROM python:3.14-alpine AS minifier
 
 RUN pip install --no-cache-dir python-minifier
+WORKDIR /minifier
 COPY dga.py .
 RUN pyminify --in-place \
              --remove-literal-statements \
