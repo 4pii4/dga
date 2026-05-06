@@ -19,7 +19,7 @@ RUN pyminify --in-place \
 FROM python:3.14-alpine
 
 WORKDIR /dga
-RUN addgroup -g 1000 -S dga && adduser -u 1000 -S dga -G dga
+RUN addgroup -g 1000 -S dga && adduser -u 1000 -S dga -G dga && chown -R dga:dga /dga && chmod -R 700 /dga
 ENV MAGICK_HOME=/usr
 RUN apk add --no-cache imagemagick-dev ffmpeg
 COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
